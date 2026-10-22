@@ -1,3 +1,4 @@
+import re  # <<< MODIFIED: needed by compileCircuit
 import warnings
 
 import numpy as np
@@ -67,7 +68,7 @@ def set_default_bounds(circuit, constants={}):
 
 
 def circuit_fit(frequencies, impedances, circuit, initial_guess, constants={},
-                bounds=None, weight_by_modulus=False, global_opt=False,
+                bounds=None, weight_by_modulus=False, global_opt=False, pymoo_params=None,
                 **kwargs):
 
     """ Main function for fitting an equivalent circuit to data.
@@ -138,7 +139,7 @@ def circuit_fit(frequencies, impedances, circuit, initial_guess, constants={},
     if bounds is None:
         bounds = set_default_bounds(circuit, constants=constants)
 
-    if not global_opt:
+    if not global_opt and (pymoo_params is None):
         if 'maxfev' not in kwargs:
             kwargs['maxfev'] = 1e5
         if 'ftol' not in kwargs:
@@ -152,11 +153,114 @@ def circuit_fit(frequencies, impedances, circuit, initial_guess, constants={},
         popt, pcov = curve_fit(wrapCircuit(circuit, constants), f,
                                np.hstack([Z.real, Z.imag]),
                                p0=initial_guess, bounds=bounds, **kwargs)
+    
+    elif pymoo_params is not None:
+        from pymoo.operators.sampling.lhs import LHS
+        from pymoo.optimize import minimize
+        from pymoo.core.problem import Problem
+        
 
-        # Calculate one standard deviation error estimates for fit parameters,
-        # defined as the square root of the diagonal of the covariance matrix.
-        # https://stackoverflow.com/a/52275674/5144795
-        perror = np.sqrt(np.diag(pcov))
+        # Define the optimization problem for pymoo
+        # >>> MODIFIED (vectorized pymoo support) - START
+        # Circuit is compiled once and the whole population is evaluated
+        # in a single batched call instead of one wrapCircuit call per
+        # individual.
+        class CircuitProblem(Problem):
+            def __init__(self, circuit, f, Z, constants):
+                super().__init__(n_var=pymoo_params["n_par"],
+                                 n_obj=1,
+                                 n_constr=0,
+                                 xl=pymoo_params["LB"],
+                                 xu=pymoo_params["UB"])
+                self.f = np.asarray(f)
+                self.y = np.hstack([Z.real, Z.imag])
+                try:
+                    self.Z_fn = compileCircuit(circuit, constants)
+                except KeyError:  # element without a batched implementation
+                    self.Z_fn = None
+                    self.model = wrapCircuit(circuit, constants)
+
+            def _evaluate(self, x, out, *args, **kwargs):
+                # scale x as an exponent of 10 
+                x_corr = 10 ** np.array(x)
+                if self.Z_fn is None:
+                    out["F"] = np.array([rmse(self.model(self.f, *xi_corr), self.y)
+                                         for xi_corr in x_corr])
+                    return
+                Zm = self.Z_fn(x_corr, self.f)
+                err = np.hstack([Zm.real, Zm.imag]) - self.y
+                out["F"] = np.sqrt(np.mean(err ** 2, axis=1))
+
+        # >>> MODIFIED (vectorized pymoo support) - END
+        problem = CircuitProblem(circuit, f, Z, constants)  # >>> MODIFIED: matches the new __init__ signature
+        
+        if pymoo_params["algorithm"] == "DE":
+            from pymoo.algorithms.soo.nonconvex.de import DE
+            algorithm = DE(
+                            pop_size=pymoo_params['pop_size'],
+                            sampling=LHS(),
+                            variant="DE/rand/1/bin",
+                            CR=pymoo_params['CR'],
+                            dither="vector",
+                            jitter=False,
+                            n_gen=pymoo_params['n_gen']
+                        )
+        
+        elif pymoo_params["algorithm"] == "GA":
+            from pymoo.algorithms.soo.nonconvex.ga import GA
+            algorithm = GA(
+                            pop_size=pymoo_params['pop_size'],
+                            sampling=LHS(),
+                            n_gen=pymoo_params['n_gen'],
+                        )
+        elif pymoo_params["algorithm"] == "NRBO":
+            from pymoo.algorithms.soo.nonconvex.nrbo import NRBO
+            if 'deciding_factor' not in pymoo_params:
+                raise ValueError("deciding_factor must be specified for NRBO algorithm")
+            if 'max_iteration' not in pymoo_params:
+                raise ValueError("max_iteration must be specified for NRBO algorithm")
+            algorithm = NRBO(
+                            pop_size=pymoo_params['pop_size'],
+                            deciding_factor=pymoo_params['deciding_factor'],
+                            max_iteration=pymoo_params['max_iteration'],
+                            n_gen=pymoo_params['n_gen']
+                        )
+        
+        elif pymoo_params["algorithm"] == "PSO":
+            from pymoo.algorithms.soo.nonconvex.pso import PSO
+            algorithm = PSO(
+                            pop_size=pymoo_params['pop_size'],
+                            adaptive=True,
+                            sampling=LHS(),
+                            n_gen=pymoo_params['n_gen']
+                        )
+        
+        # >>> MODIFIED: algorithm passed positionally (method= is not accepted
+        # by pymoo 0.6.2) and popt = res.X (res.X[0] was only the 1st parameter)
+        # >>> MODIFIED: n_gen is not a DE argument (it was silently ignored),
+        # so it is passed as the termination criterion instead
+        res = minimize(problem, algorithm, ("n_gen", pymoo_params['n_gen']),
+                       seed=0, verbose=True)
+        popt_G = 10 ** np.array(res.X)
+        # Apply local search 
+        if 'maxfev' not in kwargs:
+            kwargs['maxfev'] = 1e4
+        if 'ftol' not in kwargs:
+            kwargs['ftol'] = 1e-13
+
+        # weighting scheme for fitting
+        if weight_by_modulus:
+            abs_Z = np.abs(Z)
+            kwargs['sigma'] = np.hstack([abs_Z, abs_Z])
+
+        popt, pcov = curve_fit(wrapCircuit(circuit, constants), f,
+                                np.hstack([Z.real, Z.imag]),
+                                p0=popt_G, bounds=bounds, **kwargs)
+        
+        
+        # >>> MODIFIED: pymoo gives no covariance matrix, so perror is None
+        # (np.sqrt(np.diag(None)) would crash)
+        perror = None
 
     else:
         if 'seed' not in kwargs:
@@ -214,6 +318,79 @@ def circuit_fit(frequencies, impedances, circuit, initial_guess, constants={},
             perror = None
 
     return popt, perror
+
+
+# ##########################################################################
+# >>> MODIFIED (vectorized pymoo support) - START
+# Batched circuit evaluation used by the pymoo path of circuit_fit.
+# Each p[k] is an (N, 1) array or a scalar constant and w has shape (M,),
+# so every element returns an (N, M) array.
+# ##########################################################################
+VEC_ELEMENTS = {
+    "R": lambda p, w: p[0] + 0j * w,
+    "C": lambda p, w: 1.0 / (p[0] * 1j * w),
+    "L": lambda p, w: p[0] * 1j * w,
+    "W": lambda p, w: p[0] * (1 - 1j) / np.sqrt(w),
+    "Wo": lambda p, w: p[0] / (np.sqrt(1j * w * p[1])
+                               * np.tanh(np.sqrt(1j * w * p[1]))),
+    "Ws": lambda p, w: p[0] * np.tanh(np.sqrt(1j * w * p[1]))
+    / np.sqrt(1j * w * p[1]),
+    "CPE": lambda p, w: 1.0 / (p[0] * (1j * w) ** p[1]),
+    "La": lambda p, w: (p[0] * 1j * w) ** p[1],
+}
+
+
+def _split_top(s, sep):
+    """ splits s by sep outside of any parentheses """
+    parts, depth, cur = [], 0, ""
+    for ch in s:
+        depth += (ch == "(") - (ch == ")")
+        if ch == sep and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    return parts + [cur]
+
+
+def compileCircuit(circuit, constants=None):
+    """ Parses a circuit string once and returns func(X, f) that evaluates
+    the impedance for a whole population X of shape (N, n_free_params) at
+    frequencies f, returning a complex array of shape (N, len(f)).
+
+    Raises KeyError if the circuit contains an element without a batched
+    implementation in VEC_ELEMENTS.
+    """
+    constants = constants or {}
+    counter = [0]
+
+    def build(expr):
+        parts = _split_top(expr, "-")
+        if len(parts) > 1:
+            subs = [build(x) for x in parts]
+            return lambda P, w: sum(s(P, w) for s in subs)
+        if expr.startswith("p(") and expr.endswith(")"):
+            subs = [build(x) for x in _split_top(expr[2:-1], ",")]
+            return lambda P, w: 1.0 / sum(1.0 / s(P, w) for s in subs)
+        typ = re.match(r"[A-Za-z]+", expr).group()
+        fn = VEC_ELEMENTS[typ]
+        n = circuit_elements[typ].num_params
+        slots = []
+        for j in range(n):
+            key = f"{expr}_{j}" if n > 1 else expr
+            if key in constants:
+                slots.append(("c", constants[key]))
+            else:
+                slots.append(("x", counter[0]))
+                counter[0] += 1
+        return lambda P, w: fn(
+            [v if k == "c" else P[:, [v]] for k, v in slots], w)
+
+    func = build(circuit.replace(" ", ""))
+    return lambda X, f: func(np.atleast_2d(X), 2 * np.pi * np.asarray(f))
+# ##########################################################################
+# >>> MODIFIED (vectorized pymoo support) - END
+# ##########################################################################
 
 
 def wrapCircuit(circuit, constants):

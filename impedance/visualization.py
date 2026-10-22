@@ -37,10 +37,12 @@ def plot_nyquist(Z, scale=1, units='Ohms', fmt='.-', ax=None, labelsize=20,
         _, ax = plt.subplots()
 
     ax.plot(np.real(Z), -np.imag(Z), fmt, **kwargs)
-
-    # Make the axes square
-    ax.set_aspect('equal')
-
+    
+    # Find the largest impedance magnitude
+    Z_real_max = np.max(np.abs(np.real(Z)))
+    Z_imag_max = np.max(np.abs(np.imag(Z)))
+    Z_max = max(Z_real_max, Z_imag_max)
+    
     # Set the labels to -imaginary vs real
     ax.set_xlabel(r'$Z^{\prime}(\omega)$ ' +
                   '$[{}]$'.format(units), fontsize=labelsize)
@@ -56,7 +58,11 @@ def plot_nyquist(Z, scale=1, units='Ohms', fmt='.-', ax=None, labelsize=20,
 
     # Add a light grid
     ax.grid(visible=True, which='major', axis='both', alpha=.5)
-
+    # Set the axis limits based on the largest impedance magnitude
+    # ax.set_xlim(0.0, Z_max)
+    # ax.set_ylim(-Z_max, Z_max)
+    # Make the axes square
+    ax.set_aspect('equal', adjustable='box')
     # Change axis units to 10**log10(scale) and resize the offset text
     limits = -np.log10(scale)
     if limits != 0:
@@ -66,7 +72,7 @@ def plot_nyquist(Z, scale=1, units='Ohms', fmt='.-', ax=None, labelsize=20,
     y_offset.set_size(18)
     t = ax.xaxis.get_offset_text()
     t.set_size(18)
-
+    plt.tight_layout()
     return ax
 
 

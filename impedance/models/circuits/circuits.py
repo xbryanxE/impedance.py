@@ -58,7 +58,8 @@ class BaseCircuit:
             raise TypeError('Comparing object is not of the same type.')
 
     def fit(self, frequencies, impedance, bounds=None,
-            weight_by_modulus=False, **kwargs):
+            weight_by_modulus=False, pymoo_params=None,
+            **kwargs):
         """ Fit the circuit model
 
         Parameters
@@ -102,6 +103,7 @@ class BaseCircuit:
                                            constants=self.constants,
                                            bounds=bounds,
                                            weight_by_modulus=weight_by_modulus,
+                                           pymoo_params=pymoo_params,
                                            **kwargs)
             self.parameters_ = parameters
             if conf is not None:
@@ -207,7 +209,7 @@ class BaseCircuit:
 
         return to_print
 
-    def plot(self, ax=None, f_data=None, Z_data=None, kind='altair', **kwargs):
+    def plot(self, ax=None, f_data=None, Z_data=None, kind='altair', save_path=None, **kwargs):
         """ visualizes the model and optional data as a nyquist,
             bode, or altair (interactive) plots
 
@@ -233,7 +235,7 @@ class BaseCircuit:
         Returns
         -------
         ax: matplotlib.axes
-            axes of the created nyquist plot
+            axes of the created nyquist plot. If `save_path` is specified, the plot will also be saved to this path.
         """
 
         if kind == 'nyquist':
@@ -251,6 +253,10 @@ class BaseCircuit:
 
                 Z_fit = self.predict(f_pred)
                 ax = plot_nyquist(Z_fit, ls='-', marker='', ax=ax, **kwargs)
+            if save_path is not None:
+                plt.savefig(save_path)
+                # delete the figure to free memory
+                plt.close()
             return ax
         elif kind == 'bode':
             if ax is None:
